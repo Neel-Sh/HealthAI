@@ -14,15 +14,33 @@ struct PersistenceController {
     static let preview: PersistenceController = {
         let result = PersistenceController(inMemory: true)
         let viewContext = result.container.viewContext
-        for _ in 0..<10 {
-            let newItem = Item(context: viewContext)
-            newItem.timestamp = Date()
+        
+        // Create sample health metrics
+        for i in 0..<7 {
+            let healthMetric = HealthMetrics(context: viewContext)
+            healthMetric.id = UUID()
+            healthMetric.date = Calendar.current.date(byAdding: .day, value: -i, to: Date()) ?? Date()
+            healthMetric.stepCount = Int32.random(in: 5000...15000)
+            healthMetric.restingHeartRate = Int16.random(in: 60...100)
+            healthMetric.activeCalories = Double.random(in: 200...800)
+            healthMetric.totalDistance = Double.random(in: 1...10)
+            healthMetric.sleepHours = Double.random(in: 6...9)
         }
+        
+        // Create sample workout logs
+        for i in 0..<5 {
+            let workout = WorkoutLog(context: viewContext)
+            workout.id = UUID()
+            workout.timestamp = Calendar.current.date(byAdding: .day, value: -i, to: Date()) ?? Date()
+            workout.workoutType = ["Running", "Cycling", "Swimming", "Strength Training"].randomElement() ?? "Running"
+            workout.duration = Double.random(in: 20...90)
+            workout.calories = Double.random(in: 150...600)
+            workout.distance = Double.random(in: 1...15)
+        }
+        
         do {
             try viewContext.save()
         } catch {
-            // Replace this implementation with code to handle the error appropriately.
-            // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
             let nsError = error as NSError
             fatalError("Unresolved error \(nsError), \(nsError.userInfo)")
         }
@@ -35,23 +53,71 @@ struct PersistenceController {
         container = NSPersistentContainer(name: "HealthAI")
         if inMemory {
             container.persistentStoreDescriptions.first!.url = URL(fileURLWithPath: "/dev/null")
+        } else {
+            // Set up automatic migration options
+            let storeDescription = container.persistentStoreDescriptions.first!
+            storeDescription.shouldMigrateStoreAutomatically = true
+            storeDescription.shouldInferMappingModelAutomatically = true
         }
-        container.loadPersistentStores(completionHandler: { (storeDescription, error) in
-            if let error = error as NSError? {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
-
-                /*
-                 Typical reasons for an error here include:
-                 * The parent directory does not exist, cannot be created, or disallows writing.
-                 * The persistent store is not accessible, due to permissions or data protection when the device is locked.
-                 * The device is out of space.
-                 * The store could not be migrated to the current model version.
-                 Check the error message to determine what the actual problem was.
-                 */
-                fatalError("Unresolved error \(error), \(error.userInfo)")
-            }
-        })
+        loadPersistentStore()
         container.viewContext.automaticallyMergesChangesFromParent = true
+    }
+    
+    private func loadPersistentStore() {
+        container.loadPersistentStores { [self] (storeDescription, error) in
+            
+            if let error = error as NSError? {
+                // Check if this is a model incompatibility error (134140)
+                if error.code == 134140 {
+                    // Model incompatibility - delete the old database and try again
+                    print("Core Data model incompatibility detected. Recreating database...")
+                    
+                    if let storeURL = storeDescription.url {
+                        self.deleteStoreFiles(at: storeURL)
+                        
+                        // Try loading the store again (only once to avoid infinite recursion)
+                        container.loadPersistentStores { (_, secondError) in
+                            if let secondError = secondError {
+                                print("Failed to recreate database: \(secondError)")
+                                fatalError("Unresolved error after database recreation: \(secondError)")
+                            } else {
+                                print("Database recreated successfully")
+                            }
+                        }
+                    } else {
+                        fatalError("No store URL available for database recreation")
+                    }
+                } else {
+                    // Other Core Data errors
+                    print("Core Data error: \(error), \(error.userInfo)")
+                    fatalError("Unresolved error \(error), \(error.userInfo)")
+                }
+            } else {
+                print("Core Data store loaded successfully")
+            }
+        }
+    }
+    
+    private func deleteStoreFiles(at storeURL: URL) {
+        let fileManager = FileManager.default
+        let storeDirectory = storeURL.deletingLastPathComponent()
+        let storeName = storeURL.lastPathComponent
+        
+        // Delete main store file
+        try? fileManager.removeItem(at: storeURL)
+        
+        // Delete associated files (WAL, SHM, etc.)
+        let associatedFiles = [
+            storeName + "-wal",
+            storeName + "-shm",
+            storeName + "-journal"
+        ]
+        
+        for fileName in associatedFiles {
+            let fileURL = storeDirectory.appendingPathComponent(fileName)
+            try? fileManager.removeItem(at: fileURL)
+        }
+        
+        print("Database files deleted successfully")
     }
 }
