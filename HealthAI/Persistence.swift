@@ -61,6 +61,11 @@ struct PersistenceController {
         }
         loadPersistentStore()
         container.viewContext.automaticallyMergesChangesFromParent = true
+        container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        
+        // Configure automatic saving
+        container.viewContext.undoManager = nil
+        container.viewContext.shouldDeleteInaccessibleFaults = true
     }
     
     private func loadPersistentStore() {

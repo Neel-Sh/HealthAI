@@ -29,7 +29,7 @@ class HealthKitService: ObservableObject {
         
         print("🔑 Requesting HealthKit authorization...")
         
-        let typesToRead: Set<HKObjectType> = [
+        var typesToRead: Set<HKObjectType> = [
             HKObjectType.workoutType(),
             HKObjectType.quantityType(forIdentifier: .heartRate)!,
             HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
@@ -49,6 +49,13 @@ class HealthKitService: ObservableObject {
             HKObjectType.characteristicType(forIdentifier: .dateOfBirth)!,
             HKObjectType.characteristicType(forIdentifier: .biologicalSex)!
         ]
+
+        // Add running mobility metrics if available on this OS/device
+        if let type = HKObjectType.quantityType(forIdentifier: .runningStrideLength) { typesToRead.insert(type) }
+        if let type = HKObjectType.quantityType(forIdentifier: .runningGroundContactTime) { typesToRead.insert(type) }
+        if let type = HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation) { typesToRead.insert(type) }
+        if let type = HKObjectType.quantityType(forIdentifier: .runningPower) { typesToRead.insert(type) }
+        if let type = HKObjectType.quantityType(forIdentifier: .runningSpeed) { typesToRead.insert(type) }
         
         do {
             try await healthStore.requestAuthorization(toShare: [], read: typesToRead)
@@ -95,6 +102,55 @@ class HealthKitService: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Running Mobility Metrics (on-demand, not persisted)
+    /// Fetch most recent quantity for a HealthKit identifier with unit
+    func fetchMostRecentQuantity(for identifier: HKQuantityTypeIdentifier, unit: HKUnit) async -> Double? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: identifier) else { return nil }
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
+        return await withCheckedContinuation { continuation in
+            let query = HKSampleQuery(sampleType: type, predicate: nil, limit: 1, sortDescriptors: [sort]) { _, samples, _ in
+                if let sample = samples?.first as? HKQuantitySample {
+                    continuation.resume(returning: sample.quantity.doubleValue(for: unit))
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+            self.healthStore.execute(query)
+        }
+    }
+
+    // Convenience wrappers for running metrics
+    func getLatestRunningStrideLengthMeters() async -> Double? {
+        await fetchMostRecentQuantity(for: .runningStrideLength, unit: .meter())
+    }
+
+    func getLatestRunningCadenceSpm() async -> Double? {
+        // HealthKit does not offer a direct running cadence quantity identifier.
+        // Approximate cadence as speed / strideLength (both most recent), then convert to steps per minute.
+        async let speedMps = getLatestRunningSpeedMetersPerSecond()
+        async let strideMeters = getLatestRunningStrideLengthMeters()
+        let (speed, stride) = await (speedMps, strideMeters)
+        guard let s = speed, let l = stride, s > 0, l > 0 else { return nil }
+        // Cadence (steps/min) = (meters/second) / (meters/step) * 60
+        return (s / l) * 60.0
+    }
+
+    func getLatestRunningGroundContactMs() async -> Double? {
+        await fetchMostRecentQuantity(for: .runningGroundContactTime, unit: .secondUnit(with: .milli))
+    }
+
+    func getLatestRunningVerticalOscillationCm() async -> Double? {
+        await fetchMostRecentQuantity(for: .runningVerticalOscillation, unit: .meterUnit(with: .centi))
+    }
+
+    func getLatestRunningPowerWatts() async -> Double? {
+        await fetchMostRecentQuantity(for: .runningPower, unit: .watt())
+    }
+
+    func getLatestRunningSpeedMetersPerSecond() async -> Double? {
+        await fetchMostRecentQuantity(for: .runningSpeed, unit: .meter().unitDivided(by: .second()))
     }
     
     private func statusName(_ status: HKAuthorizationStatus) -> String {
@@ -929,19 +985,22 @@ class HealthKitService: ObservableObject {
     
     // New method to fetch detailed heart rate samples throughout the day
     private func syncDetailedHeartRate() async {
-        guard let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate) else { return }
+        guard let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate) else { 
+            print("❌ Heart rate type not available")
+            return 
+        }
         
         let calendar = Calendar.current
         let now = Date()
         let startOfDay = calendar.startOfDay(for: now)
         
-        print("🔍 Fetching detailed heart rate from \(startOfDay) to \(now)")
+        print("🔍 Fetching ALL detailed heart rate from \(startOfDay) to \(now)")
         let predicate = HKQuery.predicateForSamples(withStart: startOfDay, end: now)
         
         let query = HKSampleQuery(
             sampleType: heartRateType,
             predicate: predicate,
-            limit: 200, // Get more samples for detailed chart
+            limit: HKObjectQueryNoLimit, // Get ALL samples for the day
             sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)]
         ) { [weak self] _, samples, error in
             guard let self = self else { return }
@@ -952,7 +1011,14 @@ class HealthKitService: ObservableObject {
             }
             
             let heartRateSamples = samples as? [HKQuantitySample] ?? []
-            print("📊 Fetched \(heartRateSamples.count) heart rate samples from HealthKit")
+            print("📊 Fetched \(heartRateSamples.count) heart rate samples from HealthKit for today")
+            
+            if heartRateSamples.isEmpty {
+                print("⚠️ No heart rate data found for today. Make sure your Apple Watch is recording heart rate data.")
+            } else {
+                let hrValues = heartRateSamples.map { Int($0.quantity.doubleValue(for: .count().unitDivided(by: .minute()))) }
+                print("💓 Heart rate range: \(hrValues.min() ?? 0) - \(hrValues.max() ?? 0) bpm")
+            }
             
             Task {
                 await self.processDetailedHeartRate(samples: heartRateSamples)
@@ -973,6 +1039,7 @@ class HealthKitService: ObservableObject {
             
             do {
                 let existingReadings = try self.backgroundContext.fetch(deleteRequest)
+                print("🗑️ Deleting \(existingReadings.count) existing heart rate readings for today")
                 for reading in existingReadings {
                     self.backgroundContext.delete(reading)
                 }
@@ -981,10 +1048,12 @@ class HealthKitService: ObservableObject {
             }
             
             // Process new samples
+            print("💾 Processing \(samples.count) new heart rate samples...")
             for sample in samples {
                 let heartRateReading = HeartRateReading(context: self.backgroundContext)
                 heartRateReading.id = UUID()
-                heartRateReading.heartRate = Int16(sample.quantity.doubleValue(for: .count().unitDivided(by: .minute())))
+                let hrValue = sample.quantity.doubleValue(for: .count().unitDivided(by: .minute()))
+                heartRateReading.heartRate = Int16(hrValue)
                 heartRateReading.timestamp = sample.startDate
                 heartRateReading.isFromHealthKit = true
                 
@@ -1005,9 +1074,16 @@ class HealthKitService: ObservableObject {
             // Save changes
             do {
                 try self.backgroundContext.save()
-                print("✅ Successfully saved \(samples.count) heart rate readings")
+                print("✅ Successfully saved \(samples.count) heart rate readings to Core Data")
+                
+                // Verify the save
+                let verifyRequest: NSFetchRequest<HeartRateReading> = HeartRateReading.fetchRequest()
+                verifyRequest.predicate = NSPredicate(format: "timestamp >= %@ AND timestamp < %@", today as NSDate, tomorrow as NSDate)
+                let savedCount = try self.backgroundContext.fetch(verifyRequest).count
+                print("✅ Verified: \(savedCount) heart rate readings now in Core Data for today")
             } catch {
-                print("❌ Error saving heart rate readings: \(error)")
+                print("❌ Error saving heart rate readings: \(error.localizedDescription)")
+                self.backgroundContext.rollback()
             }
         }
     }
@@ -1026,10 +1102,14 @@ class HealthKitService: ObservableObject {
                 case "restingHeartRate":
                     let avgRestingHR = dailySamples.map { $0.quantity.doubleValue(for: .count().unitDivided(by: .minute())) }.reduce(0, +) / Double(dailySamples.count)
                     healthMetrics.restingHeartRate = Int16(avgRestingHR)
+                    // Recalculate recovery score when heart rate changes
+                    self.calculateRecoveryScore(for: healthMetrics)
                     
                 case "hrv":
                     let avgHRV = dailySamples.map { $0.quantity.doubleValue(for: .secondUnit(with: .milli)) }.reduce(0, +) / Double(dailySamples.count)
                     healthMetrics.hrv = avgHRV
+                    // Recalculate recovery score when HRV changes
+                    self.calculateRecoveryScore(for: healthMetrics)
                     
                 case "vo2Max":
                     let avgVO2Max = dailySamples.map { $0.quantity.doubleValue(for: HKUnit.literUnit(with: .milli).unitDivided(by: .gramUnit(with: .kilo).unitMultiplied(by: .minute()))) }.reduce(0, +) / Double(dailySamples.count)
@@ -1235,6 +1315,9 @@ class HealthKitService: ObservableObject {
                     let finalScore = max(1.0, min(10.0, qualityScore))
                     healthMetrics.sleepQuality = Int16(finalScore)
                     
+                    // Recalculate recovery score when sleep data changes
+                    self.calculateRecoveryScore(for: healthMetrics)
+                    
                     print("💤 Sleep Quality Calculation:")
                     print("   Total Sleep: \(totalSleepHours)h")
                     print("   Core Sleep: \(coreSleepHours)h (\(String(format: "%.1f", coreSleepPercentage * 100))%)")
@@ -1346,6 +1429,79 @@ class HealthKitService: ObservableObject {
         healthMetrics.isFromHealthKit = false
         
         return healthMetrics
+    }
+    
+    // MARK: - Recovery Score Calculation
+    
+    /// Calculate and save recovery score for a specific date
+    private func calculateRecoveryScore(for metrics: HealthMetrics) {
+        var score = 0.0
+        
+        // HRV Component (45 points) - Higher is better
+        if metrics.hrv >= 60 {
+            score += 45
+        } else if metrics.hrv >= 40 {
+            score += 35
+        } else if metrics.hrv >= 25 {
+            score += 25
+        } else if metrics.hrv > 0 {
+            score += 15
+        }
+        
+        // Resting Heart Rate Component (35 points) - Lower within range is better
+        if metrics.restingHeartRate >= 60 && metrics.restingHeartRate <= 70 {
+            score += 35 // Optimal range
+        } else if metrics.restingHeartRate < 60 {
+            score += 30 // Athletic heart rate
+        } else if metrics.restingHeartRate <= 80 {
+            score += 20 // Good range
+        } else if metrics.restingHeartRate > 0 {
+            score += 10 // Elevated
+        }
+        
+        // Energy Level Component (20 points) - Subjective readiness
+        if metrics.energyLevel >= 7 {
+            score += 20
+        } else if metrics.energyLevel >= 5 {
+            score += 15
+        } else if metrics.energyLevel > 0 {
+            score += 10
+        } else {
+            // If no energy level data, estimate from sleep quality
+            if metrics.sleepQuality >= 8 {
+                score += 18
+            } else if metrics.sleepQuality >= 6 {
+                score += 14
+            } else if metrics.sleepQuality > 0 {
+                score += 10
+            } else {
+                score += 12 // Default mid-range
+            }
+        }
+        
+        metrics.recoveryScore = min(score, 100)
+        print("💪 Recovery Score calculated: \(metrics.recoveryScore)/100 (HRV: \(metrics.hrv), RHR: \(metrics.restingHeartRate), Energy: \(metrics.energyLevel))")
+    }
+    
+    /// Update recovery scores for all recent metrics
+    func updateRecoveryScores() async {
+        await backgroundContext.perform {
+            let request: NSFetchRequest<HealthMetrics> = HealthMetrics.fetchRequest()
+            request.sortDescriptors = [NSSortDescriptor(keyPath: \HealthMetrics.date, ascending: false)]
+            request.fetchLimit = 30 // Update last 30 days
+            
+            do {
+                let metrics = try self.backgroundContext.fetch(request)
+                for metric in metrics {
+                    self.calculateRecoveryScore(for: metric)
+                }
+                
+                try self.backgroundContext.save()
+                print("✅ Updated recovery scores for \(metrics.count) metrics")
+            } catch {
+                print("❌ Error updating recovery scores: \(error)")
+            }
+        }
     }
     
     // MARK: - Force Refresh Methods

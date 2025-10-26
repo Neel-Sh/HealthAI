@@ -21,7 +21,7 @@ struct ContentView: View {
     init() {
         let context = PersistenceController.shared.container.viewContext
         _healthKitService = StateObject(wrappedValue: HealthKitService(context: context))
-        _aiService = StateObject(wrappedValue: AIService(context: context, apiKey: "")) // Configure with actual API key
+        _aiService = StateObject(wrappedValue: AIService(context: context, apiKey: nil)) // Will use environment variable or Info.plist key
         _analyticsService = StateObject(wrappedValue: AnalyticsService(context: context))
     }
 
@@ -43,21 +43,13 @@ struct ContentView: View {
                 }
                 .tag(1)
             
-            // AI Chat Tab
-            AIChatView()
-                .tabItem {
-                    Image(systemName: "brain.head.profile")
-                    Text("AI Coach")
-                }
-                .tag(2)
-            
             // Settings Tab
             SettingsView()
                 .tabItem {
                     Image(systemName: "gearshape.fill")
                     Text("Settings")
                 }
-                .tag(3)
+                .tag(2)
         }
         .environmentObject(healthKitService)
         .environmentObject(aiService)

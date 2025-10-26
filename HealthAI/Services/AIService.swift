@@ -77,6 +77,100 @@ class AIService: ObservableObject {
         
         return await sendChatRequest(prompt: prompt, systemMessage: "You are a running coach. Provide concise, actionable running insights. Use bullet points and keep responses under 120 words.")
     }
+
+    // MARK: - Running Coach (Data-Aware)
+    struct RunningMobilitySnapshot {
+        let strideLengthMeters: Double?
+        let cadenceSpm: Double?
+        let groundContactMs: Double?
+        let verticalOscillationCm: Double?
+        let powerWatts: Double?
+        let speedMps: Double?
+    }
+
+    /// Create a highly personalized running coach response that references concrete user data
+    func getRunningCoachResponse(
+        message: String,
+        runs: [WorkoutLog],
+        healthMetrics: [HealthMetrics],
+        mobility: RunningMobilitySnapshot,
+        history: [ChatMessage] = []
+    ) async -> String? {
+        // Build recent runs summary
+        let totalDistance = runs.reduce(0) { $0 + $1.distance }
+        let totalDuration = runs.reduce(0) { $0 + $1.duration }
+        let averagePace = totalDistance > 0 ? totalDuration / totalDistance : 0
+        let longest = runs.map { $0.distance }.max() ?? 0
+        let bestPace = runs.map { $0.pace }.min() ?? 0
+
+        let recentRuns = runs.prefix(6).map { run in
+            "- \(run.timestamp.formatted(date: .abbreviated, time: .omitted)): \(String(format: "%.1f", run.distance)) km, Pace: \(run.formattedPace), HR: \(run.avgHeartRate > 0 ? "\\(run.avgHeartRate)bpm" : "n/a")"
+        }.joined(separator: "\n")
+
+        // Health context (today)
+        let recentHealth = healthMetrics.first
+        let todaySummary: String = {
+            guard let h = recentHealth else { return "No health metrics available today." }
+            var s = "Steps: \(h.stepCount), Active Calories: \(Int(h.activeCalories)) kcal, Sleep: \(String(format: "%.1f", h.sleepHours)) h, HRV: \(String(format: "%.1f", h.hrv)) ms, VO2 Max: \(String(format: "%.1f", h.vo2Max)) ml/kg/min"
+            if h.restingHeartRate > 0 { s += ", Resting HR: \(h.restingHeartRate) bpm" }
+            return s
+        }()
+
+        // Mobility snapshot
+        func fmt(_ v: Double?, suffix: String, digits: Int = 0) -> String {
+            guard let v = v, v > 0 else { return "n/a" }
+            return digits == 0 ? String(format: "%.0f %@", v, suffix) : String(format: "%.1f %@", v, suffix)
+        }
+        let mobilitySummary = "Stride: \(fmt(mobility.strideLengthMeters.map { $0*100 }, suffix: "cm")) | Cadence: \(fmt(mobility.cadenceSpm, suffix: "spm")) | Ground Contact: \(fmt(mobility.groundContactMs, suffix: "ms")) | Vert. Osc.: \(fmt(mobility.verticalOscillationCm, suffix: "cm", digits: 1)) | Power: \(fmt(mobility.powerWatts, suffix: "W")) | Speed: \(fmt(mobility.speedMps, suffix: "m/s"))"
+
+        // Conversation history (brief)
+        let lastTurns = history.suffix(4).map { msg in
+            (msg.isUser ? "User" : "Coach") + ": " + msg.content
+        }.joined(separator: "\n")
+
+        // Determine intent (very simple heuristic)
+        let lower = message.lowercased()
+        let intent: String = {
+            if lower.contains("form") || lower.contains("stride") || lower.contains("cadence") { return "form" }
+            if lower.contains("pace") || lower.contains("speed") { return "pace" }
+            if lower.contains("race") { return "race" }
+            if lower.contains("recover") || lower.contains("rest") { return "recovery" }
+            if lower.contains("plan") || lower.contains("week") || lower.contains("schedule") { return "plan" }
+            return "general"
+        }()
+
+        let prompt = """
+        You are my AI Running Coach. Use ONLY the user's real data below to answer the question.
+
+        Coaching Intent: \(intent)
+        User Question: \(message)
+
+        DATA YOU MUST USE:
+        • Today: \(todaySummary)
+        • Weekly Summary: \(String(format: "%.1f", totalDistance)) km in \(formatDuration(totalDuration)), longest \(String(format: "%.1f", longest)) km, avg pace \(formatPace(averagePace))
+        • Recent Runs (last \(min(6, runs.count))):
+        \(recentRuns)
+        • Running Form Snapshot: \(mobilitySummary)
+
+        Conversation Context (last turns):
+        \(lastTurns)
+
+        Answer Requirements:
+        - Be specific to THESE numbers; quote actual values (pace, cadence, stride, HR, etc.).
+        - If form intent, analyze stride length, cadence, ground contact, vertical oscillation. Provide 2-3 tailored form cues.
+        - If pace intent, discuss realistic targets based on recent paces; give split suggestions.
+        - If plan intent, give a 1-week plan with 3-4 sessions aligned to current fitness.
+        - If race intent, give pacing and strategy with km-by-km guidance.
+        - If recovery intent, give concrete tips tied to HRV/sleep/resting HR and workload.
+        - Avoid repeating the same generic tips; vary based on the data.
+        - Keep to ~120 words using bullet points where helpful.
+        """
+
+        return await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a data-driven running coach. You must reference the exact user data provided (mobility metrics, runs, and health) and tailor advice precisely. Avoid generic repetition."
+        )
+    }
     
     // MARK: - Health Insights Chat
     func getHealthInsights(message: String, healthMetrics: [HealthMetrics], workouts: [WorkoutLog], nutritionLogs: [NutritionLog], heartRateReadings: [HeartRateReading]) async -> String? {

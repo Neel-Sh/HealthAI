@@ -1,10 +1,13 @@
 import SwiftUI
+import CoreData
 import HealthKit
 
 struct SettingsView: View {
     @EnvironmentObject var healthKitService: HealthKitService
+    @StateObject private var notificationService = NotificationService()
     @State private var isSyncing = false
     @State private var showingClearDataAlert = false
+    @AppStorage("notificationsEnabled") private var notificationsEnabled: Bool = true
     
     // Personal Information States
     @State private var height: Double = 175.0
@@ -22,6 +25,9 @@ struct SettingsView: View {
                     // Header
                     headerSection
                     
+                    // Notifications
+                    notificationsSection
+
                     // Personal Information Section
                     personalInformationSection
                     
@@ -58,6 +64,52 @@ struct SettingsView: View {
         }
     }
     
+    private var notificationsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Notifications")
+                .font(.headline)
+                .fontWeight(.medium)
+            
+            VStack(spacing: 12) {
+                HStack(spacing: 12) {
+                    Image(systemName: "bell.badge.fill")
+                        .font(.title2)
+                        .foregroundColor(.orange)
+                        .frame(width: 32, height: 32)
+                        .background(Color.orange.opacity(0.1))
+                        .cornerRadius(8)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Enable Notifications")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        Text("Hydration, meals, sleep, vitals, motivation, and summaries")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    Toggle("", isOn: $notificationsEnabled)
+                        .labelsHidden()
+                        .onChange(of: notificationsEnabled) { enabled in
+                            Task {
+                                if enabled {
+                                    await notificationService.requestAuthorization()
+                                    await notificationService.scheduleDefaultDailyReminders()
+                                } else {
+                                    await UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+                                }
+                            }
+                        }
+                }
+                .padding(16)
+                .background(Color(.systemBackground))
+                .cornerRadius(12)
+            }
+        }
+    }
+
     private var headerSection: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -590,9 +642,30 @@ struct SettingsView: View {
     }
     
     private func clearAllData() {
-        // Implementation for clearing all data
-        // This would clear Core Data entities
-        print("Clearing all data...")
+        let context = PersistenceController.shared.container.viewContext
+        
+        // Delete all entities
+        let entityNames = ["HealthMetrics", "WorkoutLog", "NutritionLog", "HeartRateReading", "MealPlan", "PlannedMeal", "Goal", "Achievement", "Milestone", "Streak", "TrainingPlan", "TrainingWorkout", "RunLog", "Item"]
+        
+        for entityName in entityNames {
+            let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: entityName)
+            let deleteRequest = NSBatchDeleteRequest(fetchRequest: fetchRequest)
+            
+            do {
+                try context.execute(deleteRequest)
+                print("✅ Cleared all \(entityName) data")
+            } catch {
+                print("❌ Failed to clear \(entityName) data: \(error)")
+            }
+        }
+        
+        // Save the context
+        do {
+            try context.save()
+            print("✅ All data cleared successfully")
+        } catch {
+            print("❌ Failed to save context after clearing data: \(error)")
+        }
     }
 }
 
