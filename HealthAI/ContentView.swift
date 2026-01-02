@@ -10,59 +10,132 @@ import CoreData
 
 struct ContentView: View {
     @Environment(\.managedObjectContext) private var viewContext
+    @Environment(\.colorScheme) private var colorScheme
     @StateObject private var healthKitService: HealthKitService
     @StateObject private var aiService: AIService
     @StateObject private var analyticsService: AnalyticsService
+    @StateObject private var workoutService = WorkoutService.shared
+    @StateObject private var exerciseDatabase = ExerciseDatabase.shared
+    @StateObject private var smartCoach = SmartCoachService.shared
+    @StateObject private var userProfile = UserProfileManager.shared
     
     @State private var selectedTab = 0
     @State private var showingHealthKitAuth = false
     @State private var showingAddWorkout = false
     
+    // Premium accent color
+    private let accentColor = Color(hex: "E07A5F")
+    
     init() {
         let context = PersistenceController.shared.container.viewContext
         _healthKitService = StateObject(wrappedValue: HealthKitService(context: context))
-        _aiService = StateObject(wrappedValue: AIService(context: context, apiKey: nil)) // Will use environment variable or Info.plist key
+        _aiService = StateObject(wrappedValue: AIService(context: context, apiKey: nil))
         _analyticsService = StateObject(wrappedValue: AnalyticsService(context: context))
+        
+        // Configure tab bar with refined appearance
+        configureTabBarAppearance()
+    }
+    
+    private func configureTabBarAppearance() {
+        let appearance = UITabBarAppearance()
+        appearance.configureWithOpaqueBackground()
+        
+        // Premium dark background
+        appearance.backgroundColor = UIColor(Color(hex: "0A0A0B"))
+        
+        // Remove separator line for cleaner look
+        appearance.shadowColor = .clear
+        appearance.shadowImage = UIImage()
+        
+        // Inactive state - subtle gray
+        let normalAttributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: UIColor(white: 0.45, alpha: 1.0),
+            .font: UIFont.systemFont(ofSize: 10, weight: .medium)
+        ]
+        
+        // Active state - warm coral accent
+        let selectedAttributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: UIColor(Color(hex: "E07A5F")),
+            .font: UIFont.systemFont(ofSize: 10, weight: .semibold)
+        ]
+        
+        appearance.stackedLayoutAppearance.normal.iconColor = UIColor(white: 0.45, alpha: 1.0)
+        appearance.stackedLayoutAppearance.normal.titleTextAttributes = normalAttributes
+        appearance.stackedLayoutAppearance.selected.iconColor = UIColor(Color(hex: "E07A5F"))
+        appearance.stackedLayoutAppearance.selected.titleTextAttributes = selectedAttributes
+        
+        // Compact layout (landscape)
+        appearance.compactInlineLayoutAppearance.normal.iconColor = UIColor(white: 0.45, alpha: 1.0)
+        appearance.compactInlineLayoutAppearance.normal.titleTextAttributes = normalAttributes
+        appearance.compactInlineLayoutAppearance.selected.iconColor = UIColor(Color(hex: "E07A5F"))
+        appearance.compactInlineLayoutAppearance.selected.titleTextAttributes = selectedAttributes
+        
+        // Inline layout
+        appearance.inlineLayoutAppearance.normal.iconColor = UIColor(white: 0.45, alpha: 1.0)
+        appearance.inlineLayoutAppearance.normal.titleTextAttributes = normalAttributes
+        appearance.inlineLayoutAppearance.selected.iconColor = UIColor(Color(hex: "E07A5F"))
+        appearance.inlineLayoutAppearance.selected.titleTextAttributes = selectedAttributes
+        
+        UITabBar.appearance().scrollEdgeAppearance = appearance
+        UITabBar.appearance().standardAppearance = appearance
+        UITabBar.appearance().unselectedItemTintColor = UIColor(white: 0.45, alpha: 1.0)
     }
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            // Health Dashboard Tab
-            HealthDashboardView()
+            // Smart Dashboard (Primary - The Connected Hub)
+            SmartDashboardView()
                 .tabItem {
-                    Image(systemName: "heart.fill")
-                    Text("Dashboard")
+                    Label("Today", systemImage: "square.grid.2x2")
                 }
                 .tag(0)
+            
+            // Workout Tab
+            WorkoutView()
+                .tabItem {
+                    Label("Workout", systemImage: "figure.strengthtraining.traditional")
+                }
+                .tag(1)
+            
+            // Running Tab
+            RunningView()
+                .tabItem {
+                    Label("Running", systemImage: "figure.run")
+                }
+                .tag(2)
             
             // Nutrition Tab
             NutritionView()
                 .tabItem {
-                    Image(systemName: "fork.knife")
-                    Text("Nutrition")
+                    Label("Nutrition", systemImage: "leaf")
                 }
-                .tag(1)
+                .tag(3)
             
-            // Settings Tab
-            SettingsView()
+            // Profile/Settings Tab
+            ProfileView()
                 .tabItem {
-                    Image(systemName: "gearshape.fill")
-                    Text("Settings")
+                    Label("Profile", systemImage: "person")
                 }
-                .tag(2)
+                .tag(4)
         }
+        .tint(accentColor)
         .environmentObject(healthKitService)
         .environmentObject(aiService)
         .environmentObject(analyticsService)
+        .environmentObject(workoutService)
+        .environmentObject(exerciseDatabase)
+        .environmentObject(smartCoach)
+        .environmentObject(userProfile)
         .environment(\.managedObjectContext, viewContext)
         .onAppear {
             requestHealthKitPermission()
             startPeriodicTasks()
+            smartCoach.configure(with: viewContext)
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-            // Refresh authorization status when app becomes active (e.g., returning from Settings)
             Task {
                 await healthKitService.refreshAuthorizationStatus()
+                smartCoach.refreshAllData()
             }
         }
     }
@@ -70,11 +143,8 @@ struct ContentView: View {
     private func requestHealthKitPermission() {
         Task {
             await healthKitService.requestAuthorization()
-            // Give authorization time to process
             try? await Task.sleep(nanoseconds: 1_000_000_000)
-            // Force refresh the authorization status
             await healthKitService.refreshAuthorizationStatus()
-            // Then try sync again
             await startPeriodicTasks()
         }
     }
@@ -82,10 +152,12 @@ struct ContentView: View {
     private func startPeriodicTasks() {
         Task {
             print("Starting HealthKit sync...")
+            // Sync user profile first for accurate age-based calculations
+            await UserProfileManager.shared.syncFromHealthKit()
             await healthKitService.syncRecentWorkouts()
             await healthKitService.syncHealthMetrics()
-            // Goal analysis removed for simplified app
             print("HealthKit sync completed")
+            print("📊 User Profile: Age=\(UserProfileManager.shared.age ?? 0), MaxHR=\(UserProfileManager.shared.maxHeartRate), Weight=\(UserProfileManager.shared.weight ?? 0)kg")
         }
     }
 }

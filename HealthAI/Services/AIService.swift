@@ -2,6 +2,7 @@ import Foundation
 import CoreData
 import UIKit
 
+@MainActor
 class AIService: ObservableObject {
     private let viewContext: NSManagedObjectContext
     private let openAIAPIKey: String
@@ -1336,4 +1337,702 @@ struct WeeklyHealthSummary {
     let stepsTrend: Double
     let sleepQualityTrend: Double
     let activeMinutesTrend: Double
+}
+
+// MARK: - Gym Coaching Extension
+extension AIService {
+    
+    // MARK: - Workout Plan Generation
+    func generateWorkoutPlan(
+        goal: GymGoal,
+        daysPerWeek: Int,
+        fitnessLevel: ExerciseDifficulty,
+        availableEquipment: [Equipment],
+        preferences: GymPreferences
+    ) async -> GeneratedWorkoutPlan? {
+        let equipmentList = availableEquipment.map { $0.rawValue }.joined(separator: ", ")
+        
+        let prompt = """
+        Create a personalized \(daysPerWeek)-day workout split for:
+        
+        Goal: \(goal.rawValue)
+        Fitness Level: \(fitnessLevel.rawValue)
+        Available Equipment: \(equipmentList)
+        Focus Areas: \(preferences.focusMuscles.map { $0.rawValue }.joined(separator: ", "))
+        Session Duration: \(preferences.sessionDurationMinutes) minutes
+        
+        Please provide a workout plan in this exact JSON format:
+        {
+            "planName": "Descriptive plan name",
+            "description": "Brief overview of the program",
+            "splitType": "PPL/Upper Lower/Full Body/Bro Split",
+            "days": [
+                {
+                    "dayNumber": 1,
+                    "name": "Day name (e.g., Push Day)",
+                    "focusMuscles": ["Chest", "Shoulders", "Triceps"],
+                    "exercises": [
+                        {
+                            "name": "Exercise name",
+                            "sets": 4,
+                            "repsMin": 8,
+                            "repsMax": 12,
+                            "restSeconds": 90,
+                            "notes": "Optional form tips"
+                        }
+                    ]
+                }
+            ],
+            "weeklyTips": ["Tip 1", "Tip 2"],
+            "progressionStrategy": "How to progress over time"
+        }
+        
+        Requirements:
+        - Include 4-6 exercises per day
+        - Start with compound movements, end with isolation
+        - Balance push/pull/legs throughout the week
+        - Consider recovery between similar muscle groups
+        - Match exercise selection to available equipment
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are an expert strength coach and personal trainer. Create detailed, effective workout programs based on client goals and constraints. Always respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        return parseWorkoutPlan(response)
+    }
+    
+    private func parseWorkoutPlan(_ jsonString: String) -> GeneratedWorkoutPlan? {
+        let cleanedString = jsonString
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleanedString.data(using: .utf8) else { return nil }
+        
+        do {
+            return try JSONDecoder().decode(GeneratedWorkoutPlan.self, from: data)
+        } catch {
+            print("Error parsing workout plan: \(error)")
+            return nil
+        }
+    }
+    
+    // MARK: - Exercise Recommendations
+    func getExerciseRecommendations(
+        targetMuscle: MuscleGroup,
+        equipment: [Equipment],
+        currentExercises: [String]
+    ) async -> [String]? {
+        let prompt = """
+        Recommend 5 effective exercises for \(targetMuscle.rawValue) using: \(equipment.map { $0.rawValue }.joined(separator: ", "))
+        
+        Current exercises in workout: \(currentExercises.joined(separator: ", "))
+        
+        Provide exercises that:
+        1. Target the muscle from different angles
+        2. Include both compound and isolation movements
+        3. Aren't already in the current workout
+        4. Are appropriate for the available equipment
+        
+        Respond with a JSON array of exercise names only:
+        ["Exercise 1", "Exercise 2", "Exercise 3", "Exercise 4", "Exercise 5"]
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a knowledgeable personal trainer. Recommend exercises concisely. Respond with valid JSON array only."
+        ) else {
+            return nil
+        }
+        
+        // Parse JSON array
+        let cleaned = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = cleaned.data(using: .utf8),
+              let exercises = try? JSONDecoder().decode([String].self, from: data) else {
+            return nil
+        }
+        
+        return exercises
+    }
+    
+    // MARK: - Form Tips
+    func getFormTips(for exerciseName: String) async -> FormTips? {
+        let prompt = """
+        Provide form tips for: \(exerciseName)
+        
+        Respond in this JSON format:
+        {
+            "keyPoints": ["Point 1", "Point 2", "Point 3"],
+            "commonMistakes": ["Mistake 1", "Mistake 2"],
+            "cues": ["Cue 1", "Cue 2"],
+            "breathingPattern": "When to inhale/exhale",
+            "targetMuscleActivation": "How to feel the muscle working"
+        }
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are an experienced strength coach focused on proper form and injury prevention. Be concise and actionable. Respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        let cleaned = response
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleaned.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(FormTips.self, from: data)
+    }
+    
+    // MARK: - Workout Analysis
+    func analyzeWorkoutSession(
+        exercises: [String],
+        setsPerExercise: [Int],
+        totalVolume: Double,
+        duration: TimeInterval,
+        musclesWorked: [MuscleGroup]
+    ) async -> WorkoutAnalysis? {
+        let muscleList = musclesWorked.map { $0.rawValue }.joined(separator: ", ")
+        let exerciseDetails = zip(exercises, setsPerExercise).map { "\($0): \($1) sets" }.joined(separator: ", ")
+        
+        let prompt = """
+        Analyze this workout session:
+        
+        Exercises: \(exerciseDetails)
+        Total Volume: \(Int(totalVolume)) kg
+        Duration: \(Int(duration / 60)) minutes
+        Muscles Worked: \(muscleList)
+        
+        Provide analysis in this JSON format:
+        {
+            "overallRating": 8,
+            "volumeAssessment": "Good volume for muscle growth",
+            "intensityLevel": "Moderate to High",
+            "recoveryEstimate": "48-72 hours",
+            "strengths": ["Point 1", "Point 2"],
+            "improvements": ["Suggestion 1", "Suggestion 2"],
+            "nextWorkoutSuggestion": "What to focus on next"
+        }
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a sports scientist analyzing workout data. Provide actionable insights. Respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        let cleaned = response
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleaned.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(WorkoutAnalysis.self, from: data)
+    }
+    
+    // MARK: - Progress Analysis
+    func analyzeProgress(
+        exerciseName: String,
+        history: [(weight: Double, reps: Int, date: Date)],
+        currentPR: Double?
+    ) async -> ProgressAnalysis? {
+        let historyString = history.prefix(10).map { 
+            "\($0.weight)kg x \($0.reps) on \($0.date.formatted(date: .abbreviated, time: .omitted))"
+        }.joined(separator: "\n")
+        
+        let prompt = """
+        Analyze strength progress for \(exerciseName):
+        
+        Recent History:
+        \(historyString)
+        
+        Current PR: \(currentPR.map { "\($0) kg" } ?? "Not set")
+        
+        Provide analysis in JSON format:
+        {
+            "trend": "Improving/Plateau/Declining",
+            "estimatedMax": 100.0,
+            "weeklyProgress": 2.5,
+            "projectedPR": 105.0,
+            "projectedPRDate": "2 weeks",
+            "recommendations": ["Recommendation 1", "Recommendation 2"],
+            "plateauBreakers": ["Strategy 1", "Strategy 2"]
+        }
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a strength coach analyzing lifting progress. Be specific with numbers and timeframes. Respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        let cleaned = response
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleaned.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(ProgressAnalysis.self, from: data)
+    }
+    
+    // MARK: - Gym Chat Coach
+    func getGymCoachResponse(
+        message: String,
+        workoutHistory: [WorkoutSession],
+        personalRecords: [PersonalRecord],
+        recentExercises: [String]
+    ) async -> String? {
+        // Build context from workout history
+        let recentWorkouts = workoutHistory.prefix(5).map { workout in
+            "\(workout.name) on \(workout.startTime.formatted(date: .abbreviated, time: .omitted)): \(workout.exercises.count) exercises, \(Int(workout.totalVolume))kg volume"
+        }.joined(separator: "\n")
+        
+        let prSummary = personalRecords.prefix(5).map { pr in
+            "\(pr.exerciseName): \(pr.value)kg"
+        }.joined(separator: ", ")
+        
+        let prompt = """
+        User Question: \(message)
+        
+        USER'S TRAINING DATA:
+        Recent Workouts:
+        \(recentWorkouts.isEmpty ? "No recent workouts" : recentWorkouts)
+        
+        Personal Records: \(prSummary.isEmpty ? "None yet" : prSummary)
+        
+        Recent Exercises: \(recentExercises.joined(separator: ", "))
+        
+        As their gym coach, provide:
+        - Specific advice based on their actual training data
+        - Actionable recommendations
+        - Encouragement and motivation
+        
+        Keep response under 150 words, use bullet points where helpful.
+        """
+        
+        return await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are an expert personal trainer and gym coach. Provide personalized, data-driven advice based on the user's actual workout history and goals. Be encouraging but honest. Focus on progressive overload, proper form, and recovery."
+        )
+    }
+}
+
+// MARK: - Gym Coaching Data Models
+enum GymGoal: String, CaseIterable, Codable {
+    case buildMuscle = "Build Muscle"
+    case loseFat = "Lose Fat"
+    case gainStrength = "Gain Strength"
+    case recomposition = "Body Recomposition"
+    case endurance = "Muscular Endurance"
+    case maintenance = "Maintenance"
+}
+
+struct GymPreferences: Codable {
+    var focusMuscles: [MuscleGroup]
+    var sessionDurationMinutes: Int
+    var preferCompounds: Bool
+    var includeSupersets: Bool
+    
+    static let `default` = GymPreferences(
+        focusMuscles: [],
+        sessionDurationMinutes: 60,
+        preferCompounds: true,
+        includeSupersets: false
+    )
+}
+
+struct GeneratedWorkoutPlan: Codable {
+    let planName: String
+    let description: String
+    let splitType: String
+    let days: [GeneratedWorkoutDay]
+    let weeklyTips: [String]
+    let progressionStrategy: String
+}
+
+struct GeneratedWorkoutDay: Codable {
+    let dayNumber: Int
+    let name: String
+    let focusMuscles: [String]
+    let exercises: [GeneratedExercise]
+}
+
+struct GeneratedExercise: Codable {
+    let name: String
+    let sets: Int
+    let repsMin: Int
+    let repsMax: Int
+    let restSeconds: Int
+    let notes: String?
+}
+
+struct FormTips: Codable {
+    let keyPoints: [String]
+    let commonMistakes: [String]
+    let cues: [String]
+    let breathingPattern: String
+    let targetMuscleActivation: String
+}
+
+struct WorkoutAnalysis: Codable {
+    let overallRating: Int
+    let volumeAssessment: String
+    let intensityLevel: String
+    let recoveryEstimate: String
+    let strengths: [String]
+    let improvements: [String]
+    let nextWorkoutSuggestion: String
+}
+
+struct ProgressAnalysis: Codable {
+    let trend: String
+    let estimatedMax: Double
+    let weeklyProgress: Double
+    let projectedPR: Double
+    let projectedPRDate: String
+    let recommendations: [String]
+    let plateauBreakers: [String]
+}
+
+// MARK: - Integrated Smart Coach Extension
+extension AIService {
+    
+    /// The ultimate smart coach response - connects workout, nutrition, health, and recovery data
+    func getIntegratedCoachResponse(
+        message: String,
+        smartCoachContext: String,
+        conversationHistory: [ChatMessage] = []
+    ) async -> String? {
+        let recentMessages = conversationHistory.suffix(6).map { msg in
+            "\(msg.isUser ? "User" : "Coach"): \(msg.content)"
+        }.joined(separator: "\n")
+        
+        let prompt = """
+        You are an elite AI fitness coach with complete access to the user's fitness data. Answer their question using their REAL data below.
+        
+        USER'S COMPLETE FITNESS PROFILE:
+        \(smartCoachContext)
+        
+        CONVERSATION CONTEXT:
+        \(recentMessages)
+        
+        USER'S QUESTION: \(message)
+        
+        RESPONSE REQUIREMENTS:
+        1. Reference SPECIFIC numbers from their data (protein intake, sleep hours, recovery %, workout volume, etc.)
+        2. Connect multiple data points when relevant (e.g., "Your HRV of X combined with Y hours of sleep suggests...")
+        3. Provide actionable, personalized recommendations
+        4. If they ask about workout/training: consider their recovery status and muscle recovery map
+        5. If they ask about nutrition: tie it to their training status and goals
+        6. If they ask about recovery: analyze sleep, HRV, training load, and nutrition together
+        7. Be encouraging but data-driven
+        8. Keep response under 180 words using bullet points where helpful
+        
+        NEVER give generic advice. ALWAYS reference their specific numbers and situation.
+        """
+        
+        return await sendChatRequest(
+            prompt: prompt,
+            systemMessage: """
+            You are an elite personal trainer, sports scientist, and nutritionist combined. You have complete access to the user's:
+            - Real-time health metrics (HRV, sleep, heart rate, recovery)
+            - Complete workout history (exercises, sets, reps, volume)
+            - Nutrition data (calories, macros, meal timing)
+            - Personal records and progress trends
+            - Muscle recovery status for each muscle group
+            
+            Your job is to provide hyper-personalized coaching that connects ALL aspects of their fitness journey. Never give generic advice - always reference specific data points. Help them understand how their sleep affects their training, how their nutrition impacts recovery, and how their workout choices align with their goals.
+            """
+        )
+    }
+    
+    /// Generate a complete daily action plan based on all user data
+    func generateDailyActionPlan(
+        readinessScore: Int,
+        muscleRecoveryMap: [String: Double],
+        nutritionStatus: (calories: Double, protein: Double, calorieTarget: Double, proteinTarget: Double),
+        recommendedWorkout: String,
+        weeklyWorkouts: Int,
+        fitnessGoal: String
+    ) async -> DailyActionPlan? {
+        let recoveryString = muscleRecoveryMap.map { "\($0.key): \(Int($0.value))%" }.joined(separator: ", ")
+        
+        let prompt = """
+        Create a personalized daily action plan based on this user's data:
+        
+        TODAY'S READINESS: \(readinessScore)/100
+        FITNESS GOAL: \(fitnessGoal)
+        
+        MUSCLE RECOVERY STATUS:
+        \(recoveryString)
+        
+        NUTRITION SO FAR:
+        - Calories: \(Int(nutritionStatus.calories))/\(Int(nutritionStatus.calorieTarget)) kcal
+        - Protein: \(Int(nutritionStatus.protein))/\(Int(nutritionStatus.proteinTarget))g
+        
+        TRAINING CONTEXT:
+        - Recommended Workout: \(recommendedWorkout)
+        - Workouts This Week: \(weeklyWorkouts)
+        
+        Provide a daily action plan in this JSON format:
+        {
+            "morningPriorities": [
+                {"task": "Task description", "reason": "Why this matters", "priority": 1}
+            ],
+            "workoutRecommendation": {
+                "shouldTrain": true,
+                "workoutType": "Push/Pull/Legs/Rest",
+                "intensity": "High/Moderate/Light",
+                "focusAreas": ["Area 1", "Area 2"],
+                "durationMinutes": 60,
+                "keyExercises": ["Exercise 1", "Exercise 2", "Exercise 3"]
+            },
+            "nutritionTargets": {
+                "remainingProtein": 80,
+                "remainingCalories": 1500,
+                "mealSuggestions": ["Meal 1", "Meal 2"],
+                "timingTips": "When to eat for optimal performance"
+            },
+            "recoveryActions": ["Action 1", "Action 2"],
+            "eveningChecklist": ["Item 1", "Item 2"],
+            "motivationalNote": "Personalized encouragement"
+        }
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a comprehensive fitness coach creating personalized daily action plans. Be specific, actionable, and data-driven. Respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        return parseDailyActionPlan(response)
+    }
+    
+    private func parseDailyActionPlan(_ jsonString: String) -> DailyActionPlan? {
+        let cleaned = jsonString
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleaned.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(DailyActionPlan.self, from: data)
+    }
+    
+    /// Analyze the connection between sleep, recovery, and performance
+    func analyzeRecoveryCorrelations(
+        sleepData: [(hours: Double, quality: Int, date: Date)],
+        workoutPerformance: [(volume: Double, intensity: Double, date: Date)],
+        hrvData: [(value: Double, date: Date)]
+    ) async -> RecoveryCorrelationAnalysis? {
+        let sleepSummary = sleepData.prefix(7).map { 
+            "\($0.date.formatted(date: .abbreviated, time: .omitted)): \($0.hours)h, quality \($0.quality)/10"
+        }.joined(separator: "\n")
+        
+        let workoutSummary = workoutPerformance.prefix(7).map {
+            "\($0.date.formatted(date: .abbreviated, time: .omitted)): \(Int($0.volume))kg volume, intensity \(Int($0.intensity * 100))%"
+        }.joined(separator: "\n")
+        
+        let hrvSummary = hrvData.prefix(7).map {
+            "\($0.date.formatted(date: .abbreviated, time: .omitted)): \(Int($0.value))ms"
+        }.joined(separator: "\n")
+        
+        let prompt = """
+        Analyze the correlations between this user's sleep, HRV, and workout performance:
+        
+        SLEEP DATA (last 7 days):
+        \(sleepSummary)
+        
+        HRV DATA:
+        \(hrvSummary)
+        
+        WORKOUT PERFORMANCE:
+        \(workoutSummary)
+        
+        Provide analysis in this JSON format:
+        {
+            "sleepPerformanceCorrelation": "Strong positive/Weak/Negative",
+            "hrvRecoveryCorrelation": "Strong positive/Weak/Negative",
+            "optimalSleepForPerformance": 7.5,
+            "hrvThresholdForHardTraining": 45,
+            "patterns": [
+                "Pattern 1 you noticed",
+                "Pattern 2 you noticed"
+            ],
+            "recommendations": [
+                "Specific recommendation 1",
+                "Specific recommendation 2"
+            ],
+            "warningSignsToWatch": ["Sign 1", "Sign 2"],
+            "personalizedInsight": "A unique insight about their recovery patterns"
+        }
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a sports scientist specializing in recovery and performance optimization. Analyze data patterns and provide specific, actionable insights. Respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        let cleaned = response
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleaned.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(RecoveryCorrelationAnalysis.self, from: data)
+    }
+    
+    /// Get personalized nutrition timing recommendations based on workout schedule
+    func getNutritionTimingPlan(
+        workoutTime: Date?,
+        workoutType: String,
+        currentMacros: (protein: Double, carbs: Double, fat: Double),
+        dailyTargets: (protein: Double, carbs: Double, fat: Double, calories: Double),
+        fitnessGoal: String
+    ) async -> NutritionTimingPlan? {
+        let timeString = workoutTime.map { 
+            DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) 
+        } ?? "No workout planned"
+        
+        let prompt = """
+        Create a nutrition timing plan for today:
+        
+        WORKOUT: \(workoutType) at \(timeString)
+        GOAL: \(fitnessGoal)
+        
+        CURRENT INTAKE:
+        - Protein: \(Int(currentMacros.protein))g / \(Int(dailyTargets.protein))g
+        - Carbs: \(Int(currentMacros.carbs))g / \(Int(dailyTargets.carbs))g
+        - Fat: \(Int(currentMacros.fat))g / \(Int(dailyTargets.fat))g
+        - Calories: \(Int(currentMacros.protein * 4 + currentMacros.carbs * 4 + currentMacros.fat * 9)) / \(Int(dailyTargets.calories))
+        
+        Provide a timing plan in JSON format:
+        {
+            "preWorkoutMeal": {
+                "timing": "1-2 hours before",
+                "macros": {"protein": 25, "carbs": 40, "fat": 10},
+                "examples": ["Option 1", "Option 2"],
+                "reason": "Why this matters"
+            },
+            "intraWorkout": {
+                "needed": true,
+                "suggestion": "What to have during workout if needed"
+            },
+            "postWorkoutMeal": {
+                "timing": "Within 1 hour",
+                "macros": {"protein": 40, "carbs": 50, "fat": 15},
+                "examples": ["Option 1", "Option 2"],
+                "reason": "Why this matters"
+            },
+            "remainingMeals": [
+                {
+                    "timing": "Suggested time",
+                    "focus": "What to prioritize",
+                    "examples": ["Option 1"]
+                }
+            ],
+            "keyTips": ["Tip 1", "Tip 2"]
+        }
+        """
+        
+        guard let response = await sendChatRequest(
+            prompt: prompt,
+            systemMessage: "You are a sports nutritionist specializing in nutrient timing for performance and muscle building. Provide specific, practical advice. Respond with valid JSON only."
+        ) else {
+            return nil
+        }
+        
+        let cleaned = response
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let data = cleaned.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(NutritionTimingPlan.self, from: data)
+    }
+}
+
+// MARK: - Integrated Coach Data Models
+struct DailyActionPlan: Codable {
+    let morningPriorities: [ActionItem]
+    let workoutRecommendation: WorkoutPlanRecommendation
+    let nutritionTargets: NutritionTargets
+    let recoveryActions: [String]
+    let eveningChecklist: [String]
+    let motivationalNote: String
+    
+    struct ActionItem: Codable {
+        let task: String
+        let reason: String
+        let priority: Int
+    }
+    
+    struct WorkoutPlanRecommendation: Codable {
+        let shouldTrain: Bool
+        let workoutType: String
+        let intensity: String
+        let focusAreas: [String]
+        let durationMinutes: Int
+        let keyExercises: [String]
+    }
+    
+    struct NutritionTargets: Codable {
+        let remainingProtein: Double
+        let remainingCalories: Double
+        let mealSuggestions: [String]
+        let timingTips: String
+    }
+}
+
+struct RecoveryCorrelationAnalysis: Codable {
+    let sleepPerformanceCorrelation: String
+    let hrvRecoveryCorrelation: String
+    let optimalSleepForPerformance: Double
+    let hrvThresholdForHardTraining: Double
+    let patterns: [String]
+    let recommendations: [String]
+    let warningSignsToWatch: [String]
+    let personalizedInsight: String
+}
+
+struct NutritionTimingPlan: Codable {
+    let preWorkoutMeal: MealTiming
+    let intraWorkout: IntraWorkout
+    let postWorkoutMeal: MealTiming
+    let remainingMeals: [RemainingMeal]
+    let keyTips: [String]
+    
+    struct MealTiming: Codable {
+        let timing: String
+        let macros: Macros
+        let examples: [String]
+        let reason: String
+        
+        struct Macros: Codable {
+            let protein: Double
+            let carbs: Double
+            let fat: Double
+        }
+    }
+    
+    struct IntraWorkout: Codable {
+        let needed: Bool
+        let suggestion: String
+    }
+    
+    struct RemainingMeal: Codable {
+        let timing: String
+        let focus: String
+        let examples: [String]
+    }
 } 

@@ -1,7 +1,9 @@
 import Foundation
 import HealthKit
 import CoreData
+import CoreLocation
 
+@MainActor
 class HealthKitService: ObservableObject {
     private let healthStore = HKHealthStore()
     private let viewContext: NSManagedObjectContext
@@ -16,7 +18,11 @@ class HealthKitService: ObservableObject {
         self.viewContext = context
         self.backgroundContext = PersistenceController.shared.container.newBackgroundContext()
         self.backgroundContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
-        Task { await checkAuthorizationStatus() }
+        Task { 
+            await checkAuthorizationStatus()
+            // Sync user profile data on init
+            await UserProfileManager.shared.syncFromHealthKit()
+        }
         setupBackgroundSync()
     }
     
@@ -50,12 +56,37 @@ class HealthKitService: ObservableObject {
             HKObjectType.characteristicType(forIdentifier: .biologicalSex)!
         ]
 
-        // Add running mobility metrics if available on this OS/device
+        // Workout routes (maps)
+        // Note: some SDKs define HKSeriesTypeIdentifier as String (no `.workoutRoute` static),
+        // so we use the global identifier constant.
+        if let routeType = HKObjectType.seriesType(forIdentifier: HKWorkoutRouteTypeIdentifier) {
+            typesToRead.insert(routeType)
+        }
+        
+        // Add running metrics if available on this OS/device
         if let type = HKObjectType.quantityType(forIdentifier: .runningStrideLength) { typesToRead.insert(type) }
         if let type = HKObjectType.quantityType(forIdentifier: .runningGroundContactTime) { typesToRead.insert(type) }
         if let type = HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation) { typesToRead.insert(type) }
         if let type = HKObjectType.quantityType(forIdentifier: .runningPower) { typesToRead.insert(type) }
         if let type = HKObjectType.quantityType(forIdentifier: .runningSpeed) { typesToRead.insert(type) }
+        
+        // Extended running dynamics + related metrics (added by raw identifier so we can gracefully support older/newer SDKs)
+        let extraQuantityTypeRawIDs: [String] = [
+            "HKQuantityTypeIdentifierRunningCadence",
+            "HKQuantityTypeIdentifierRunningStepLength",
+            "HKQuantityTypeIdentifierRunningVerticalRatio",
+            "HKQuantityTypeIdentifierRunningAsymmetryPercentage",
+            "HKQuantityTypeIdentifierRunningGroundContactTimeBalance",
+            // Often shown as “double support time” in Fitness. This is a walking metric but can be present for runs on some devices.
+            "HKQuantityTypeIdentifierWalkingDoubleSupportPercentage"
+        ]
+        
+        for raw in extraQuantityTypeRawIDs {
+            let id = HKQuantityTypeIdentifier(rawValue: raw)
+            if let type = HKObjectType.quantityType(forIdentifier: id) {
+                typesToRead.insert(type)
+            }
+        }
         
         do {
             try await healthStore.requestAuthorization(toShare: [], read: typesToRead)
@@ -373,17 +404,31 @@ class HealthKitService: ObservableObject {
     }
     
     private func processWorkouts(_ workouts: [HKWorkout]) async {
-        await backgroundContext.perform {
+        // 1) Insert new workouts (fast Core Data writes)
+        let uuidsNeedingEnrichment: Set<String> = await backgroundContext.perform {
+            var needsEnrichment = Set<String>()
+            
             for workout in workouts {
+                let uuid = workout.uuid.uuidString
+                
                 // Check if workout already exists
-                if self.workoutExistsSync(healthKitUUID: workout.uuid.uuidString, in: self.backgroundContext) {
+                if self.workoutExistsSync(healthKitUUID: uuid, in: self.backgroundContext) {
+                    // Backfill route/metrics for existing workouts if missing
+                    let request: NSFetchRequest<WorkoutLog> = WorkoutLog.fetchRequest()
+                    request.predicate = NSPredicate(format: "healthKitUUID == %@", uuid)
+                    request.fetchLimit = 1
+                    if let existing = (try? self.backgroundContext.fetch(request))?.first {
+                        if existing.route == nil || existing.avgHeartRate == 0 || existing.maxHeartRate == 0 {
+                            needsEnrichment.insert(uuid)
+                        }
+                    }
                     continue
                 }
                 
                 // Create new workout log
                 let workoutLog = WorkoutLog(context: self.backgroundContext)
-                workoutLog.id = UUID() // Assign UUID directly instead of UUID().uuidString
-                workoutLog.healthKitUUID = workout.uuid.uuidString
+                workoutLog.id = UUID()
+                workoutLog.healthKitUUID = uuid
                 workoutLog.isFromHealthKit = true
                 workoutLog.timestamp = workout.startDate
                 workoutLog.duration = workout.duration
@@ -391,7 +436,7 @@ class HealthKitService: ObservableObject {
                 
                 // Distance
                 if let distance = workout.totalDistance {
-                    workoutLog.distance = distance.doubleValue(for: .meter()) / 1000.0 // Convert to km
+                    workoutLog.distance = distance.doubleValue(for: .meter()) / 1000.0 // km
                 }
                 
                 // Calories
@@ -399,20 +444,50 @@ class HealthKitService: ObservableObject {
                     workoutLog.calories = energy.doubleValue(for: .kilocalorie())
                 }
                 
-                // Calculate pace
+                // Pace (seconds per km)
                 if workoutLog.distance > 0 && workoutLog.duration > 0 {
-                    workoutLog.pace = workoutLog.duration / workoutLog.distance * 60 // seconds per km
+                    workoutLog.pace = workoutLog.duration / workoutLog.distance
                 }
                 
-                // Get additional metrics
-                // await self.getWorkoutMetrics(for: workout, workoutLog: workoutLog) // This line was removed as per the new_code
+                needsEnrichment.insert(uuid)
             }
             
-            // Save changes
             do {
                 try self.backgroundContext.save()
             } catch {
-                print("Error saving workout: \(error)")
+                print("Error saving workouts: \(error)")
+            }
+            
+            return needsEnrichment
+        }
+        
+        // 2) Enrich workouts with metrics + route (slower HealthKit reads)
+        let workoutsToEnrich = workouts.filter { uuidsNeedingEnrichment.contains($0.uuid.uuidString) }
+        guard !workoutsToEnrich.isEmpty else { return }
+        
+        var metricsByUUID: [String: WorkoutMetricsResult] = [:]
+        for workout in workoutsToEnrich {
+            metricsByUUID[workout.uuid.uuidString] = await fetchWorkoutMetrics(for: workout)
+        }
+        
+        await backgroundContext.perform {
+            for (uuid, result) in metricsByUUID {
+                let request: NSFetchRequest<WorkoutLog> = WorkoutLog.fetchRequest()
+                request.predicate = NSPredicate(format: "healthKitUUID == %@", uuid)
+                request.fetchLimit = 1
+                
+                guard let workoutLog = (try? self.backgroundContext.fetch(request))?.first else { continue }
+                
+                if let avg = result.avgHeartRate { workoutLog.avgHeartRate = avg }
+                if let max = result.maxHeartRate { workoutLog.maxHeartRate = max }
+                if let elevationGain = result.elevationGain { workoutLog.elevation = elevationGain }
+                if let routeData = result.routeData { workoutLog.route = routeData }
+            }
+            
+            do {
+                try self.backgroundContext.save()
+            } catch {
+                print("Error saving workout enrichments: \(error)")
             }
         }
     }
@@ -429,51 +504,122 @@ class HealthKitService: ObservableObject {
         }
     }
     
-    private func getWorkoutMetrics(for workout: HKWorkout, workoutLog: WorkoutLog) async {
-        // Get heart rate data
-        await getHeartRateData(for: workout, workoutLog: workoutLog)
-        
-        // Get elevation data
-        await getElevationData(for: workout, workoutLog: workoutLog)
-        
-        // Get route data
-        await getRouteData(for: workout, workoutLog: workoutLog)
+    // MARK: - Workout Enrichment (route + HR stats)
+    
+    private struct WorkoutMetricsResult {
+        let avgHeartRate: Int16?
+        let maxHeartRate: Int16?
+        let elevationGain: Double?
+        let routeData: Data?
     }
     
-    private func getHeartRateData(for workout: HKWorkout, workoutLog: WorkoutLog) async {
-        guard let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate) else { return }
+    private func fetchWorkoutMetrics(for workout: HKWorkout) async -> WorkoutMetricsResult {
+        async let hrStats = fetchHeartRateStats(for: workout)
+        async let routePoints = fetchRoutePoints(for: workout)
         
+        let (stats, points) = await (hrStats, routePoints)
+        
+        // Elevation gain from route altitudes (if present)
+        let elevationGain = points.flatMap { computeElevationGain(from: $0) }
+        
+        return WorkoutMetricsResult(
+            avgHeartRate: stats?.avg,
+            maxHeartRate: stats?.max,
+            elevationGain: elevationGain,
+            routeData: RouteCoding.encode(points ?? [])
+        )
+    }
+    
+    private func fetchHeartRateStats(for workout: HKWorkout) async -> (avg: Int16, max: Int16)? {
+        guard let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate) else { return nil }
         let predicate = HKQuery.predicateForSamples(withStart: workout.startDate, end: workout.endDate)
         
-        let heartRateQuery = HKStatisticsQuery(
-            quantityType: heartRateType,
-            quantitySamplePredicate: predicate,
-            options: [.discreteAverage, .discreteMax]
-        ) { _, statistics, _ in
-            guard let statistics = statistics else { return }
-            
-            if let avgHeartRate = statistics.averageQuantity() {
-                workoutLog.avgHeartRate = Int16(avgHeartRate.doubleValue(for: .count().unitDivided(by: .minute())))
+        return await withCheckedContinuation { continuation in
+            let query = HKStatisticsQuery(
+                quantityType: heartRateType,
+                quantitySamplePredicate: predicate,
+                options: [.discreteAverage, .discreteMax]
+            ) { _, statistics, _ in
+                guard let statistics else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                
+                let unit = HKUnit.count().unitDivided(by: .minute())
+                let avg = statistics.averageQuantity()?.doubleValue(for: unit)
+                let max = statistics.maximumQuantity()?.doubleValue(for: unit)
+                
+                guard let avg, let max else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                
+                continuation.resume(returning: (avg: Int16(avg.rounded()), max: Int16(max.rounded())))
             }
             
-            if let maxHeartRate = statistics.maximumQuantity() {
-                workoutLog.maxHeartRate = Int16(maxHeartRate.doubleValue(for: .count().unitDivided(by: .minute())))
-            }
+            healthStore.execute(query)
+        }
+    }
+    
+    private func fetchRoutePoints(for workout: HKWorkout) async -> [RoutePoint]? {
+        guard let routeType = HKObjectType.seriesType(forIdentifier: HKWorkoutRouteTypeIdentifier) as? HKSeriesType else {
+            return nil
         }
         
-        healthStore.execute(heartRateQuery)
+        let predicate = HKQuery.predicateForObjects(from: workout)
+        
+        let routes: [HKWorkoutRoute] = await withCheckedContinuation { continuation in
+            let query = HKSampleQuery(
+                sampleType: routeType,
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { _, samples, _ in
+                continuation.resume(returning: (samples as? [HKWorkoutRoute]) ?? [])
+            }
+            healthStore.execute(query)
+        }
+        
+        guard !routes.isEmpty else { return nil }
+        
+        var allPoints: [RoutePoint] = []
+        for route in routes {
+            let points: [RoutePoint] = await withCheckedContinuation { continuation in
+                var collected: [RoutePoint] = []
+                let query = HKWorkoutRouteQuery(route: route) { _, locations, done, _ in
+                    if let locations {
+                        collected.append(contentsOf: locations.map {
+                            RoutePoint(
+                                latitude: $0.coordinate.latitude,
+                                longitude: $0.coordinate.longitude,
+                                altitudeMeters: $0.verticalAccuracy >= 0 ? $0.altitude : nil,
+                                timestamp: $0.timestamp
+                            )
+                        })
+                    }
+                    if done {
+                        continuation.resume(returning: collected)
+                    }
+                }
+                healthStore.execute(query)
+            }
+            
+            allPoints.append(contentsOf: points)
+        }
+        
+        return allPoints.isEmpty ? nil : allPoints
     }
     
-    private func getElevationData(for workout: HKWorkout, workoutLog: WorkoutLog) async {
-        // Implementation for elevation data from route
-        // This is a placeholder - would need to process route data
-        workoutLog.elevation = 0
-    }
-    
-    private func getRouteData(for workout: HKWorkout, workoutLog: WorkoutLog) async {
-        // Implementation for route data
-        // This is a placeholder - would need to process location data
-        workoutLog.route = nil
+    private func computeElevationGain(from points: [RoutePoint]) -> Double? {
+        let alts = points.compactMap { $0.altitudeMeters }
+        guard alts.count >= 2 else { return nil }
+        
+        var gain: Double = 0
+        for i in 1..<alts.count {
+            let delta = alts[i] - alts[i - 1]
+            if delta > 0 { gain += delta }
+        }
+        return gain
     }
     
     private func mapWorkoutType(_ type: HKWorkoutActivityType) -> String {
@@ -529,6 +675,7 @@ class HealthKitService: ObservableObject {
         // Sync all health vitals for real-time updates
         await syncStepCount()
         await syncActiveCalories()
+        await syncActiveMinutes()
         await syncBasalCalories()
         await syncRestingHeartRate()
         await syncDetailedHeartRate() // Add detailed heart rate sync
@@ -565,6 +712,7 @@ class HealthKitService: ObservableObject {
         await syncWorkoutCount()
         await syncDistanceWalked()
         await syncActiveCalories()
+        await syncActiveMinutes()
         await syncBasalCalories()
         await syncRestingHeartRate()
         await syncDetailedHeartRate() // Add detailed heart rate sync
@@ -624,6 +772,57 @@ class HealthKitService: ObservableObject {
                 print("Updated today's workout count to: \(count)")
             } catch {
                 print("Error saving workout count: \(error)")
+            }
+        }
+    }
+    
+    private func syncActiveMinutes() async {
+        guard let exerciseTimeType = HKQuantityType.quantityType(forIdentifier: .appleExerciseTime) else { return }
+        
+        let calendar = Calendar.current
+        let now = Date()
+        let startOfDay = calendar.startOfDay(for: now)
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startOfDay, end: now)
+        
+        let activeMinutes = await withCheckedContinuation { continuation in
+            let query = HKStatisticsQuery(
+                quantityType: exerciseTimeType,
+                quantitySamplePredicate: predicate,
+                options: .cumulativeSum
+            ) { _, statistics, error in
+                if let error = error {
+                    print("❌ Error fetching exercise time: \(error.localizedDescription)")
+                    continuation.resume(returning: 0)
+                    return
+                }
+                
+                let minutes = statistics?.sumQuantity()?.doubleValue(for: .minute()) ?? 0
+                print("📊 Today's exercise time: \(Int(minutes)) minutes")
+                continuation.resume(returning: Int(minutes))
+            }
+            
+            healthStore.execute(query)
+        }
+        
+        await updateTodaysActiveMinutes(minutes: activeMinutes)
+    }
+    
+    private func updateTodaysActiveMinutes(minutes: Int) async {
+        let today = Calendar.current.startOfDay(for: Date())
+        
+        await backgroundContext.perform {
+            let healthMetrics = self.getOrCreateHealthMetricsSync(for: today, in: self.backgroundContext)
+            
+            print("🏃 Updating active minutes: \(minutes) for date: \(today)")
+            healthMetrics.activeMinutes = Int16(minutes)
+            healthMetrics.isFromHealthKit = true
+            
+            do {
+                try self.backgroundContext.save()
+                print("✅ Updated today's active minutes to: \(minutes)")
+            } catch {
+                print("❌ Error saving active minutes: \(error)")
             }
         }
     }
@@ -1518,6 +1717,274 @@ class HealthKitService: ObservableObject {
         await syncTodaysActiveCalories()
         await syncTodaysBasalCalories()
         await syncStepCount()
+        
+        // Also sync user profile to keep age, weight, etc. accurate
+        await UserProfileManager.shared.syncFromHealthKit()
+    }
+    
+    // MARK: - Running Form Metrics (Most Recent)
+    
+    /// Fetch all running form metrics for display
+    func getLatestRunningFormMetrics() async -> RunningFormMetrics {
+        async let strideLength = getLatestRunningStrideLengthMeters()
+        async let groundContact = getLatestRunningGroundContactMs()
+        async let verticalOsc = getLatestRunningVerticalOscillationCm()
+        async let power = getLatestRunningPowerWatts()
+        async let speed = getLatestRunningSpeedMetersPerSecond()
+        async let cadence = getLatestRunningCadenceSpm()
+        
+        let (stride, gct, vo, pwr, spd, cad) = await (strideLength, groundContact, verticalOsc, power, speed, cadence)
+        
+        return RunningFormMetrics(
+            strideLength: stride,
+            groundContactTime: gct,
+            verticalOscillation: vo,
+            runningPower: pwr,
+            runningSpeed: spd,
+            cadence: cad,
+            runningCadenceHK: nil,
+            stepLength: nil,
+            verticalRatio: nil,
+            asymmetryPercentage: nil,
+            groundContactTimeBalance: nil,
+            doubleSupportPercentage: nil,
+            cardioRecovery1Min: nil,
+            lastUpdated: Date()
+        )
+    }
+    
+    /// Fetch running form metrics from a specific workout time range
+    func getRunningFormMetrics(from startDate: Date, to endDate: Date) async -> RunningFormMetrics {
+        async let strideLength = fetchAverageRunningMetric(.runningStrideLength, unit: .meter(), start: startDate, end: endDate)
+        async let groundContact = fetchAverageRunningMetric(.runningGroundContactTime, unit: .secondUnit(with: .milli), start: startDate, end: endDate)
+        async let verticalOsc = fetchAverageRunningMetric(.runningVerticalOscillation, unit: .meterUnit(with: .centi), start: startDate, end: endDate)
+        async let power = fetchAverageRunningMetric(.runningPower, unit: .watt(), start: startDate, end: endDate)
+        async let speed = fetchAverageRunningMetric(.runningSpeed, unit: .meter().unitDivided(by: .second()), start: startDate, end: endDate)
+        
+        // Extended dynamics (best-effort)
+        async let cadenceHK = fetchAverageRunningMetricRaw("HKQuantityTypeIdentifierRunningCadence", unit: HKUnit.count().unitDivided(by: .minute()), start: startDate, end: endDate)
+        async let stepLength = fetchAverageRunningMetricRaw("HKQuantityTypeIdentifierRunningStepLength", unit: .meter(), start: startDate, end: endDate)
+        async let verticalRatio = fetchAverageRunningMetricRaw("HKQuantityTypeIdentifierRunningVerticalRatio", unit: .percent(), start: startDate, end: endDate)
+        async let asymmetry = fetchAverageRunningMetricRaw("HKQuantityTypeIdentifierRunningAsymmetryPercentage", unit: .percent(), start: startDate, end: endDate)
+        async let gctBalance = fetchAverageRunningMetricRaw("HKQuantityTypeIdentifierRunningGroundContactTimeBalance", unit: .percent(), start: startDate, end: endDate)
+        async let doubleSupport = fetchAverageRunningMetricRaw("HKQuantityTypeIdentifierWalkingDoubleSupportPercentage", unit: .percent(), start: startDate, end: endDate)
+        async let cardioRecovery1Min = fetchHeartRateRecovery1Min(workoutEnd: endDate)
+        
+        let (stride, gct, vo, pwr, spd) = await (strideLength, groundContact, verticalOsc, power, speed)
+        let (cadHK, stepLen, vRatio, asym, gctBal, dblSupport, hrRec1) = await (
+            cadenceHK,
+            stepLength,
+            verticalRatio,
+            asymmetry,
+            gctBalance,
+            doubleSupport,
+            cardioRecovery1Min
+        )
+        
+        // Calculate cadence from speed and stride if available
+        var cadence: Double? = nil
+        if let cadHK {
+            cadence = cadHK
+        } else if let s = spd, let l = stride, s > 0, l > 0 {
+            cadence = (s / l) * 60.0 // steps per minute
+        }
+        
+        return RunningFormMetrics(
+            strideLength: stride,
+            groundContactTime: gct,
+            verticalOscillation: vo,
+            runningPower: pwr,
+            runningSpeed: spd,
+            cadence: cadence,
+            runningCadenceHK: cadHK,
+            stepLength: stepLen,
+            verticalRatio: vRatio,
+            asymmetryPercentage: asym,
+            groundContactTimeBalance: gctBal,
+            doubleSupportPercentage: dblSupport,
+            cardioRecovery1Min: hrRec1,
+            lastUpdated: Date()
+        )
+    }
+    
+    /// Fetch average metric over a time range
+    private func fetchAverageRunningMetric(_ identifier: HKQuantityTypeIdentifier, unit: HKUnit, start: Date, end: Date) async -> Double? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: identifier) else { return nil }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        
+        return await withCheckedContinuation { continuation in
+            let query = HKStatisticsQuery(
+                quantityType: type,
+                quantitySamplePredicate: predicate,
+                options: .discreteAverage
+            ) { _, statistics, error in
+                if let error = error {
+                    // These metrics require Apple Watch with running dynamics support
+                    // It's normal to not have this data - just return nil silently
+                    continuation.resume(returning: nil)
+                    return
+                }
+                
+                if let avgQuantity = statistics?.averageQuantity() {
+                    let value = avgQuantity.doubleValue(for: unit)
+                    continuation.resume(returning: value)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+            healthStore.execute(query)
+        }
+    }
+    
+    private func fetchAverageRunningMetricRaw(_ rawIdentifier: String, unit: HKUnit, start: Date, end: Date) async -> Double? {
+        let id = HKQuantityTypeIdentifier(rawValue: rawIdentifier)
+        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return nil }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        
+        return await withCheckedContinuation { continuation in
+            let query = HKStatisticsQuery(
+                quantityType: type,
+                quantitySamplePredicate: predicate,
+                options: .discreteAverage
+            ) { _, statistics, _ in
+                continuation.resume(returning: statistics?.averageQuantity()?.doubleValue(for: unit))
+            }
+            healthStore.execute(query)
+        }
+    }
+    
+    private func fetchHeartRateRecovery1Min(workoutEnd: Date) async -> Double? {
+        guard let heartRateType = HKQuantityType.quantityType(forIdentifier: .heartRate) else { return nil }
+        let unit = HKUnit.count().unitDivided(by: .minute())
+        
+        let endWindowStart = workoutEnd.addingTimeInterval(-30)
+        let endWindowPredicate = HKQuery.predicateForSamples(withStart: endWindowStart, end: workoutEnd)
+        
+        let afterEnd = workoutEnd.addingTimeInterval(60)
+        let recoveryPredicate = HKQuery.predicateForSamples(withStart: workoutEnd, end: afterEnd)
+        
+        async let hrAtEnd = fetchAverageHeartRate(type: heartRateType, unit: unit, predicate: endWindowPredicate)
+        async let hrAfter1 = fetchAverageHeartRate(type: heartRateType, unit: unit, predicate: recoveryPredicate)
+        
+        guard let endHR = await hrAtEnd, let afterHR = await hrAfter1 else { return nil }
+        return max(0, endHR - afterHR)
+    }
+    
+    private func fetchAverageHeartRate(type: HKQuantityType, unit: HKUnit, predicate: NSPredicate) async -> Double? {
+        await withCheckedContinuation { continuation in
+            let query = HKStatisticsQuery(
+                quantityType: type,
+                quantitySamplePredicate: predicate,
+                options: .discreteAverage
+            ) { _, statistics, _ in
+                continuation.resume(returning: statistics?.averageQuantity()?.doubleValue(for: unit))
+            }
+            healthStore.execute(query)
+        }
+    }
+    
+    /// Get running form metrics from the last 30 days of runs
+    func getRecentRunningFormSummary() async -> RunningFormMetrics {
+        let thirtyDaysAgo = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? Date()
+        
+        // First, fetch recent running workouts
+        let workoutType = HKObjectType.workoutType()
+        let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
+        let workoutPredicate = HKQuery.predicateForSamples(withStart: thirtyDaysAgo, end: Date())
+        let runningPredicate = HKQuery.predicateForWorkouts(with: .running)
+        let compoundPredicate = NSCompoundPredicate(andPredicateWithSubpredicates: [workoutPredicate, runningPredicate])
+        
+        let workouts: [HKWorkout] = await withCheckedContinuation { continuation in
+            let query = HKSampleQuery(
+                sampleType: workoutType,
+                predicate: compoundPredicate,
+                limit: 20,
+                sortDescriptors: [sortDescriptor]
+            ) { _, samples, error in
+                let runs = samples as? [HKWorkout] ?? []
+                continuation.resume(returning: runs)
+            }
+            healthStore.execute(query)
+        }
+        
+        guard !workouts.isEmpty else {
+            print("⚠️ No recent running workouts found for form analysis")
+            return RunningFormMetrics.empty
+        }
+        
+        print("📊 Found \(workouts.count) recent running workouts for form analysis")
+        
+        // Aggregate metrics from all runs
+        var allStrides: [Double] = []
+        var allGCT: [Double] = []
+        var allVO: [Double] = []
+        var allPower: [Double] = []
+        var allSpeed: [Double] = []
+        var allCadenceHK: [Double] = []
+        var allStepLength: [Double] = []
+        var allVerticalRatio: [Double] = []
+        var allAsym: [Double] = []
+        var allGctBalance: [Double] = []
+        var allDoubleSupport: [Double] = []
+        var allRecovery1: [Double] = []
+        
+        for workout in workouts {
+            let metrics = await getRunningFormMetrics(from: workout.startDate, to: workout.endDate)
+            
+            if let stride = metrics.strideLength { allStrides.append(stride) }
+            if let gct = metrics.groundContactTime { allGCT.append(gct) }
+            if let vo = metrics.verticalOscillation { allVO.append(vo) }
+            if let power = metrics.runningPower { allPower.append(power) }
+            if let speed = metrics.runningSpeed { allSpeed.append(speed) }
+            if let cadHK = metrics.runningCadenceHK { allCadenceHK.append(cadHK) }
+            if let step = metrics.stepLength { allStepLength.append(step) }
+            if let vr = metrics.verticalRatio { allVerticalRatio.append(vr) }
+            if let a = metrics.asymmetryPercentage { allAsym.append(a) }
+            if let b = metrics.groundContactTimeBalance { allGctBalance.append(b) }
+            if let ds = metrics.doubleSupportPercentage { allDoubleSupport.append(ds) }
+            if let r = metrics.cardioRecovery1Min { allRecovery1.append(r) }
+        }
+        
+        // Calculate averages
+        let avgStride = allStrides.isEmpty ? nil : allStrides.reduce(0, +) / Double(allStrides.count)
+        let avgGCT = allGCT.isEmpty ? nil : allGCT.reduce(0, +) / Double(allGCT.count)
+        let avgVO = allVO.isEmpty ? nil : allVO.reduce(0, +) / Double(allVO.count)
+        let avgPower = allPower.isEmpty ? nil : allPower.reduce(0, +) / Double(allPower.count)
+        let avgSpeed = allSpeed.isEmpty ? nil : allSpeed.reduce(0, +) / Double(allSpeed.count)
+        let avgCadenceHK = allCadenceHK.isEmpty ? nil : allCadenceHK.reduce(0, +) / Double(allCadenceHK.count)
+        let avgStepLength = allStepLength.isEmpty ? nil : allStepLength.reduce(0, +) / Double(allStepLength.count)
+        let avgVerticalRatio = allVerticalRatio.isEmpty ? nil : allVerticalRatio.reduce(0, +) / Double(allVerticalRatio.count)
+        let avgAsym = allAsym.isEmpty ? nil : allAsym.reduce(0, +) / Double(allAsym.count)
+        let avgGctBalance = allGctBalance.isEmpty ? nil : allGctBalance.reduce(0, +) / Double(allGctBalance.count)
+        let avgDoubleSupport = allDoubleSupport.isEmpty ? nil : allDoubleSupport.reduce(0, +) / Double(allDoubleSupport.count)
+        let avgRecovery1 = allRecovery1.isEmpty ? nil : allRecovery1.reduce(0, +) / Double(allRecovery1.count)
+        
+        // Calculate cadence
+        var avgCadence: Double? = nil
+        if let cad = avgCadenceHK {
+            avgCadence = cad
+        } else if let stride = avgStride, let speed = avgSpeed, stride > 0 {
+            avgCadence = (speed / stride) * 60.0
+        }
+        
+        return RunningFormMetrics(
+            strideLength: avgStride,
+            groundContactTime: avgGCT,
+            verticalOscillation: avgVO,
+            runningPower: avgPower,
+            runningSpeed: avgSpeed,
+            cadence: avgCadence,
+            runningCadenceHK: avgCadenceHK,
+            stepLength: avgStepLength,
+            verticalRatio: avgVerticalRatio,
+            asymmetryPercentage: avgAsym,
+            groundContactTimeBalance: avgGctBalance,
+            doubleSupportPercentage: avgDoubleSupport,
+            cardioRecovery1Min: avgRecovery1,
+            lastUpdated: Date()
+        )
     }
     
     // MARK: - User Profile Data
@@ -1684,5 +2151,109 @@ struct UserProfile {
             return String(format: "%.1f kg", weight)
         }
         return "Unknown"
+    }
+}
+
+// MARK: - Running Form Metrics Model
+struct RunningFormMetrics {
+    let strideLength: Double? // meters
+    let groundContactTime: Double? // milliseconds
+    let verticalOscillation: Double? // centimeters
+    let runningPower: Double? // watts
+    let runningSpeed: Double? // meters per second
+    let cadence: Double? // steps per minute
+    
+    // Extended dynamics (best-effort if HealthKit provides them)
+    let runningCadenceHK: Double? // steps per minute (HealthKit)
+    let stepLength: Double? // meters
+    let verticalRatio: Double? // %
+    let asymmetryPercentage: Double? // %
+    let groundContactTimeBalance: Double? // %
+    let doubleSupportPercentage: Double? // %
+    let cardioRecovery1Min: Double? // bpm drop in first minute post-workout
+    
+    let lastUpdated: Date
+    
+    var hasData: Bool {
+        strideLength != nil ||
+            groundContactTime != nil ||
+            verticalOscillation != nil ||
+            runningPower != nil ||
+            cadence != nil ||
+            runningCadenceHK != nil ||
+            stepLength != nil ||
+            verticalRatio != nil ||
+            asymmetryPercentage != nil ||
+            groundContactTimeBalance != nil ||
+            doubleSupportPercentage != nil ||
+            cardioRecovery1Min != nil
+    }
+    
+    static var empty: RunningFormMetrics {
+        RunningFormMetrics(
+            strideLength: nil,
+            groundContactTime: nil,
+            verticalOscillation: nil,
+            runningPower: nil,
+            runningSpeed: nil,
+            cadence: nil,
+            runningCadenceHK: nil,
+            stepLength: nil,
+            verticalRatio: nil,
+            asymmetryPercentage: nil,
+            groundContactTimeBalance: nil,
+            doubleSupportPercentage: nil,
+            cardioRecovery1Min: nil,
+            lastUpdated: Date()
+        )
+    }
+    
+    // Formatted display strings
+    var formattedStrideLength: String {
+        if let stride = strideLength {
+            return String(format: "%.2f m", stride)
+        }
+        return "N/A"
+    }
+    
+    var formattedGroundContactTime: String {
+        if let gct = groundContactTime {
+            return String(format: "%.0f ms", gct)
+        }
+        return "N/A"
+    }
+    
+    var formattedVerticalOscillation: String {
+        if let vo = verticalOscillation {
+            return String(format: "%.1f cm", vo)
+        }
+        return "N/A"
+    }
+    
+    var formattedPower: String {
+        if let power = runningPower {
+            return String(format: "%.0f W", power)
+        }
+        return "N/A"
+    }
+    
+    var formattedCadence: String {
+        if let cadence = cadence {
+            return String(format: "%.0f spm", cadence)
+        }
+        return "N/A"
+    }
+    
+    var formattedSpeed: String {
+        if let speed = runningSpeed {
+            // Convert m/s to min/km pace
+            if speed > 0 {
+                let paceSecondsPerKm = 1000.0 / speed
+                let minutes = Int(paceSecondsPerKm) / 60
+                let seconds = Int(paceSecondsPerKm) % 60
+                return String(format: "%d:%02d /km", minutes, seconds)
+            }
+        }
+        return "N/A"
     }
 }

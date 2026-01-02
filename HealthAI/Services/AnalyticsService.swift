@@ -1,6 +1,7 @@
 import Foundation
 import CoreData
 
+@MainActor
 class AnalyticsService: ObservableObject {
     private let viewContext: NSManagedObjectContext
     
