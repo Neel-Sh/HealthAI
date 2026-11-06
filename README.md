@@ -1,107 +1,34 @@
-# HealthAI - Your Intelligent Fitness Companion
+# HealthAI
 
-HealthAI is an advanced iOS fitness application that combines artificial intelligence with comprehensive health tracking to provide personalized fitness insights, nutrition recommendations, and workout analytics.
+An experimental iOS fitness app combining HealthKit data, running and workout tracking, nutrition logs, and AI-assisted coaching. Built with SwiftUI and Core Data.
 
-## Features
+## Included features
 
-### 🏃‍♂️ Workout Tracking
-- Automatic workout detection and logging
-- Detailed metrics including distance, pace, heart rate, and perceived exertion
-- AI-powered performance analysis and recommendations
-- Recovery tips based on workout intensity
+- Health dashboards, sleep views, goals, and achievements.
+- Running sessions, route maps, workout planning, and an exercise library.
+- Nutrition and water logging.
+- Coaching and recovery prompts through `HealthAI/Services/AIService.swift`.
 
-### 🍎 Nutrition Management
-- Smart meal logging with AI image recognition
-- Comprehensive nutritional analysis including macro and micronutrients
-- Personalized meal recommendations
-- Water intake tracking
-- Caloric deficit analysis
+These describe the source tree, not a claim that every device or live-service journey has been verified.
 
-### 💪 Health Analytics
-- Real-time health metrics monitoring
-- Sleep quality analysis
-- Heart rate variability (HRV) tracking
-- VO2 max estimation
-- Recovery and readiness scores
+## Run locally
 
-### 🤖 AI-Powered Features
-- Personalized workout recommendations
-- Recovery optimization
-- Nutrition insights
-- Progress predictions
-- Health trend analysis
+1. Open `HealthAI.xcodeproj` in Xcode with an iOS 18 or newer SDK. The project deployment target is **iOS 18.0**.
+2. Select the **HealthAI** scheme and your own signing team.
+3. Run on an iPhone for HealthKit, location, and workout behavior. Simulator data is not equivalent to a physical workout.
+4. For optional AI calls, set `OPENAI_API_KEY` in your **local, unshared Xcode Run scheme environment**. The service reads process environment variables; there is no `.env` loader or `.env.example` in this app.
 
-## Requirements
+Do not put credentials in source files, shared schemes, or a distributed app's Info.plist. AI requests send the prompt's workout, health, or conversation context to the configured OpenAI service. Review the prompt construction before using personal health data.
 
-- iOS 15.0+
-- Xcode 13.0+
-- Swift 5.0+
-- HealthKit compatible device
+## Project map
 
-## Installation
+| Path | Purpose |
+| --- | --- |
+| `HealthAI/Models/` | Health, nutrition, goals, workouts, and run data |
+| `HealthAI/Services/` | HealthKit, running, coaching, notifications, and analytics |
+| `HealthAI/Views/` | Dashboard and feature interfaces |
+| `HealthAITests/`, `HealthAIUITests/` | Xcode test targets |
 
-1. Clone the repository
+Use Xcode's **Product → Test** for the chosen destination. Report device permissions, backend configuration, and checks actually run with changes; see [Contributing](CONTRIBUTING.md).
 
-
-2. Open the project in Xcode
-```bash
-cd HealthAI
-open HealthAI.xcodeproj
-```
-
-3. Set up your OpenAI API key:
-   - Create a copy of `.env.example` and name it `.env`
-   - Add your OpenAI API key to the `.env` file
-   - Or add it directly to your Info.plist as `OPENAI_API_KEY`
-
-4. Build and run the project in Xcode
-
-## Configuration
-
-### HealthKit Permissions
-The app requires the following HealthKit permissions:
-- Steps
-- Heart Rate
-- Workouts
-- Sleep Analysis
-- Active Energy
-- Height
-- Weight
-
-### API Keys
-Make sure to configure your OpenAI API key in one of these locations:
-1. Environment variable: `OPENAI_API_KEY`
-2. Info.plist: Add as `OPENAI_API_KEY`
-3. Direct initialization of `AIService` with API key
-
-## Architecture
-
-The app follows the MVVM (Model-View-ViewModel) architecture pattern and includes:
-
-### Core Components
-- `Models/`: Data models and CoreData entities
-- `Views/`: SwiftUI views and UI components
-- `ViewModels/`: View models and business logic
-- `Services/`: Core services including AI, HealthKit, and Analytics
-
-### Key Services
-- `AIService`: Handles AI-powered features and OpenAI integration
-- `HealthKitService`: Manages health data access and synchronization
-- `AnalyticsService`: Tracks user metrics and app performance
-- `AchievementService`: Manages user achievements and goals
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-
-## Acknowledgments
-
-- OpenAI for providing the AI capabilities
-- Apple HealthKit for health data integration
-- The iOS development community for various open-source contributions
-
+This is a software experiment; its generated coaching and metrics have not been clinically validated. No repository-wide license file is included.
